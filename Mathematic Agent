@@ -1,0 +1,125 @@
+from openai import OpenAI
+from datasets import load_dataset
+from tqdm import tqdm
+import time
+import re
+
+# API 클라이언트 설정
+client = OpenAI(api_key=api_key)
+
+# 사용할 샘플 수
+max_samples = 1000
+dataset = load_dataset("gsm8k", "main", split=f"test[:{max_samples}]")
+
+# GPT-4o 호출 함수 (정답 형식 유도 프롬프트 포함)
+def query_gpt(question: str, model="gpt-4o"):
+    try:
+        prompt = (
+            f"Q: {question.strip()}\n\n"
+            "A: Please answer the question and provide only the final answer at the end in the following format: 'The answer is [number]'."
+        )
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful math assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error in query_gpt: {e}")
+        return None
+
+# 정답 숫자 추출 함수 (The answer is [number] 형식에서 추출)
+def extract_final_answer(output: str):
+    if not output:
+        return None
+
+    output_cleaned = output.replace(",", "")
+
+    match = re.search(r"The answer is\s+([-+]?\d*\.?\d+)", output_cleaned, re.IGNORECASE)
+    if match:
+        num_str = match.group(1)
+
+    else:
+        boxed = re.search(r"\\boxed{([-+]?\d*\.?\d+)}", output_cleaned)
+        if boxed:
+            num_str = boxed.group(1)
+        else:
+            num_str = None
+            for line in reversed(output_cleaned.splitlines()):
+                if any(kw in line.lower() for kw in ["therefore", "answer", "final", "so", "in conclusion"]):
+                    nums = re.findall(r"[-+]?\d*\.?\d+", line)
+                    if nums:
+                        num_str = nums[0]
+                        break
+            if num_str is None:
+                matches = re.findall(r"[-+]?\d*\.?\d+", output_cleaned)
+                num_str = matches[-1] if matches else None
+
+    if num_str is None:
+        return None
+
+    # 숫자 문자열을 float으로 변환 후, 정수라면 int로 변환해 소수점 제거
+    try:
+        num_float = float(num_str)
+        if num_float.is_integer():
+            return str(int(num_float))
+        else:
+            return str(num_float)
+    except:
+        return num_str
+
+
+# 평가 루프
+correct = 0
+results = []
+
+# 쉼표 제거 + 소수점 정리 함수
+def normalize_answer(ans: str):
+    try:
+        ans_clean = ans.replace(",", "")
+        num = float(ans_clean)
+        if num.is_integer():
+            return str(int(num))
+        else:
+            return str(num)
+    except:
+        return ans.strip()
+
+# 평가 루프 중 비교 부분
+for example in tqdm(dataset):
+    question = example["question"]
+    gt_answer = normalize_answer(example["answer"].split("####")[-1].strip())
+
+    output = query_gpt(question)
+    pred_answer_raw = extract_final_answer(output) if output else "None"
+    pred_answer = normalize_answer(pred_answer_raw)
+
+    is_correct = pred_answer == gt_answer
+    correct += is_correct
+
+    results.append({
+        "question": question,
+        "ground_truth": gt_answer,
+        "prediction": pred_answer,
+        "full_output": output,
+        "is_correct": is_correct
+    })
+
+    time.sleep(1.0)  # OpenAI API rate limit 고려
+
+
+# 결과 출력
+accuracy = correct / max_samples
+print(f"\nAccuracy: {accuracy:.2%}")
+
+# 틀린 문제 일부 출력
+wrong_samples = [r for r in results if not r["is_correct"]]
+print(f"\nWrong samples ({len(wrong_samples)}):")
+for sample in wrong_samples[:]:  # 틀린 경우 모두 출력
+    print(f"\nQ: {sample['question']}")
+    print(f"GT: {sample['ground_truth']} | Pred: {sample['prediction']}")
+    print(f"Model Output:\n{sample['full_output']}")
